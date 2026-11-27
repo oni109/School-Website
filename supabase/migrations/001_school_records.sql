@@ -51,6 +51,9 @@ language sql stable security definer set search_path = '' as $$ select private.a
 create or replace function private.app_uid() returns text
 language sql stable security definer set search_path = '' as $$ select private.app_me()->>'id' $$;
 
+create or replace function private.my_class_ids() returns text[]
+language plpgsql stable security definer set search_path = '' as $$ begin return '{}'; end $$;
+
 create or replace function private.my_student_ids() returns text[]
 language plpgsql stable security definer set search_path = '' as $$
 declare me jsonb := private.app_me(); r text := me->>'role'; out text[];
@@ -209,11 +212,11 @@ create policy records_select_auth on public.records for select to authenticated 
         id = (select private.app_uid())
         or data->>'role' in ('admin', 'teacher')
         or ((select private.app_role()) = 'teacher' and data->'childIds' ?| (select private.my_student_ids()))))
-  or (collection = 'students' and id = any((select private.my_student_ids())))
-  or (collection in ('scores', 'reports') and data->>'studentId' = any((select private.my_visible_result_ids())))
-  or (collection = 'attendance' and (select private.app_role()) = 'teacher' and data->>'classId' = any((select private.my_class_ids())))
-  or (collection = 'payments' and data->>'studentId' = any((select private.my_student_ids())))
-  or (collection = 'homework' and data->>'classId' = any((select private.my_class_ids())))
+  or (collection = 'students' and id = any((select private.my_student_ids())::text[]))
+  or (collection in ('scores', 'reports') and data->>'studentId' = any((select private.my_visible_result_ids())::text[]))
+  or (collection = 'attendance' and (select private.app_role()) = 'teacher' and data->>'classId' = any((select private.my_class_ids())::text[]))
+  or (collection = 'payments' and data->>'studentId' = any((select private.my_student_ids())::text[]))
+  or (collection = 'homework' and data->>'classId' = any((select private.my_class_ids())::text[]))
   or (collection = 'announcements' and (
         data->>'audience' = 'all' or data->>'audience' = (select private.app_role()) or data->>'author' = (select private.app_uid())))
   or (collection = 'messages' and data->'participants' ? (select private.app_uid()))
@@ -241,7 +244,11 @@ create or replace function private.records_guard() returns trigger
 language plpgsql security definer set search_path = '' as $$
 declare
   k text;
-  trusted boolean := coalesce(auth.role(), '') = 'service_role' or current_user in ('postgres', 'supabase_admin');
+  -- auth.role() comes from the caller's API token: 'anon', 'authenticated' or 'service_role'.
+  -- It is empty only for direct database connections (migrations, dashboard SQL).
+  -- (current_user cannot be used here: inside SECURITY DEFINER it is always the owner.)
+  caller text := coalesce(auth.role(), '');
+  trusted boolean := caller in ('service_role', '');
   is_admin boolean := trusted or coalesce(private.app_role() = 'admin', false);
 begin
   new.updated_at := now();
@@ -469,7 +476,7 @@ end $$;
 revoke all on function public.is_setup_done(), public.submit_application(jsonb), public.track_application(text, text),
   public.submit_enquiry(jsonb), public.subscribe_updates(text), public.check_result(text, text),
   public.result_context(text, text, int), public.my_attendance(), public.toggle_homework(text, text),
-  public.post_message(text, text), public.mark_thread_read(text) from public;
+  public.post_message(text, text), public.mark_thread_read(text) from public, anon, authenticated;
 grant execute on function public.is_setup_done(), public.submit_application(jsonb), public.track_application(text, text),
   public.submit_enquiry(jsonb), public.subscribe_updates(text), public.check_result(text, text) to anon, authenticated;
 grant execute on function public.result_context(text, text, int), public.my_attendance(), public.toggle_homework(text, text),

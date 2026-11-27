@@ -3,7 +3,7 @@
    ===================================================================== */
 (function () {
   'use strict';
-  const EPS = window.EPS, S = EPS.Store.load(), U = EPS.UI;
+  const EPS = window.EPS, S = EPS.Store, U = EPS.UI, Cloud = EPS.Cloud;
   const { esc, attr, fmtDate, money, placeholder } = U;
   const $ = (sel, root) => (root || document).querySelector(sel);
   const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
@@ -47,8 +47,10 @@
     $('#newsletter').addEventListener('submit', e => {
       e.preventDefault();
       const email = $('#nl-email').value.trim();
+      const done = () => { e.target.reset(); U.toast('Thank you — you will receive school updates.'); };
+      if (S.cloud) { Cloud.rpc('subscribe_updates', { p_email: email }).then(done, err => U.toast(err.message, 'bad')); return; }
       if (!S.find('subscribers', x => x.email === email)) S.insert('subscribers', { email, created: new Date().toISOString() });
-      e.target.reset(); U.toast('Thank you — you will receive school updates.');
+      done();
     });
   }
 
@@ -247,19 +249,26 @@
       submitApplication();
     });
   }
-  function submitApplication() {
+  async function submitApplication() {
     const d = appDraft;
     const cls = S.find('classes', c => c.name === d.classSought);
-    const ref = S.nextApplicationRef();
     const now = EPS.today();
-    S.insert('applications', {
-      ref, status: 'Submitted', created: now,
+    const app = {
       child: { firstName: d.firstName, lastName: d.lastName, otherName: d.otherName || '', gender: d.gender, dob: d.dob, stateOfOrigin: d.stateOfOrigin || '', religion: d.religion || '' },
       classSought: d.classSought, section: cls ? cls.section : '', prevSchool: d.prevSchool || '', lastClass: d.lastClass || '', heard: d.heard || '',
       parent: { name: d.pName, phone: d.pPhone, email: d.pEmail || '', relationship: d.pRelationship, address: d.pAddress || '', occupation: d.pOccupation || '' },
-      medical: d.medical || '', notes: d.notes || '', examDate: '', history: [{ at: now, status: 'Submitted', note: 'Application received online.' }]
-    });
-    S.log('public', 'New admission application ' + ref + ' for ' + d.firstName + ' ' + d.lastName + ' (' + d.classSought + ').');
+      medical: d.medical || '', notes: d.notes || ''
+    };
+    let ref;
+    if (S.cloud) {
+      const btn = $('#apply-form button[type=submit]'); if (btn) { btn.disabled = true; btn.textContent = 'SUBMITTING…'; }
+      try { ref = await Cloud.rpc('submit_application', { p: app }); }
+      catch (err) { U.toast(err.message || 'Could not submit. Please try again.', 'bad'); if (btn) { btn.disabled = false; btn.textContent = 'SUBMIT APPLICATION'; } return; }
+    } else {
+      ref = S.nextApplicationRef();
+      S.insert('applications', Object.assign({ ref, status: 'Submitted', created: now, examDate: '', history: [{ at: now, status: 'Submitted', note: 'Application received online.' }] }, app));
+      S.log('public', 'New admission application ' + ref + ' for ' + d.firstName + ' ' + d.lastName + ' (' + d.classSought + ').');
+    }
     try { sessionStorage.removeItem('eps.appDraft'); } catch (e) { }
     const name = d.firstName + ' ' + d.lastName, phone = d.pPhone, cs = d.classSought;
     appDraft = null; appStep = 0;
@@ -272,11 +281,15 @@
   pages.track = (q) => {
     setTimeout(() => {
       const form = $('#track-form');
-      form.addEventListener('submit', e => {
+      form.addEventListener('submit', async e => {
         e.preventDefault();
         const d = U.formData(form);
         const norm = p => String(p).replace(/\D/g, '').replace(/^234/, '0');
-        const app = S.find('applications', a => a.ref.toUpperCase() === d.ref.toUpperCase() && norm(a.parent.phone) === norm(d.phone));
+        let app;
+        if (S.cloud) {
+          try { app = await Cloud.rpc('track_application', { p_ref: d.ref, p_phone: d.phone }); }
+          catch (err) { U.toast(err.message, 'bad'); return; }
+        } else app = S.find('applications', a => a.ref.toUpperCase() === d.ref.toUpperCase() && norm(a.parent.phone) === norm(d.phone));
         const out = $('#track-out');
         if (!app) { out.innerHTML = '<div class="notice-box warn" style="margin-top:20px">No application matches that reference and phone number. Please check and try again, or contact the school office.</div>'; return; }
         const cls = { Submitted: 'info', 'Under review': 'warn', 'Exam scheduled': 'warn', Admitted: 'ok', Declined: 'bad', Waitlisted: 'warn' }[app.status] || '';
@@ -411,6 +424,7 @@
         e.preventDefault();
         const d = U.formData(e.target);
         const out = $('#res-out');
+        if (S.cloud) { checkResultOnline(d, out); return; }
         const stu = S.find('students', x => x.admNo.toUpperCase() === d.admNo.toUpperCase());
         const pin = S.find('pins', p => p.pin === d.pin.replace(/\s/g, ''));
         if (!stu || !pin) { out.innerHTML = '<div class="notice-box warn" style="margin-top:20px">Invalid admission number or PIN. Please check and try again.</div>'; return; }
@@ -431,20 +445,50 @@
       (demoStudent ? '<p class="hint">Demo: admission no. <b>' + esc(demoStudent.admNo) + '</b>, PIN <b>' + esc(demoPin.pin) + '</b></p>' : '') + '</form><div id="res-out"></div></div></section>';
   };
 
+  /** Result checker against the school database: the server validates the PIN and returns one report. */
+  async function checkResultOnline(d, out) {
+    const warn = t => { out.innerHTML = '<div class="notice-box warn" style="margin-top:20px">' + t + '</div>'; };
+    let r;
+    try { r = await Cloud.rpc('check_result', { p_adm: d.admNo, p_pin: d.pin }); }
+    catch (err) { warn(esc(err.message)); return; }
+    if (!r || !r.ok) {
+      const msg = { invalid: 'Invalid admission number or PIN. Please check and try again.', used_other: 'This PIN has already been used for another student.', exhausted: 'This PIN has reached its maximum of ' + (r && r.maxUses) + ' uses. Please obtain a new PIN from the school.', withheld: 'This result is temporarily unavailable. Please contact the bursary.' }[r && r.error];
+      warn(msg || 'The result could not be loaded.'); return;
+    }
+    // Load only this report into the page's (read-only) data.
+    const st = S.settings;
+    const put = (col, item) => { if (!item) return; const list = S.all(col); const i = list.findIndex(x => x.id === item.id); if (i >= 0) list[i] = item; else list.push(item); };
+    put('students', r.student);
+    r.scores.forEach(x => put('scores', x));
+    put('reports', r.report);
+    r.attendance.forEach(x => put('attendance', x));
+    put('users', r.teacher);
+    S.resultContext[[r.student.id, st.session, Number(st.term)].join('|')] = r.context;
+    const name = S.studentName(r.student);
+    out.innerHTML = '<div class="no-print" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin:26px 0 12px"><span class="muted">PIN used ' + r.uses + ' of ' + r.maxUses + ' times.</span><button class="btn" id="res-print">🖨 Print / save as PDF</button></div>' + U.reportCard(r.student.id);
+    $('#res-print').onclick = () => U.printHTML('Report card — ' + name, U.reportCard(r.student.id));
+    out.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
   pages.faq = () => pageHero('Help', 'Frequently asked questions', 'Answers to common questions from parents and guardians.', IMG('photo-1588072432836-e10032774350'), 'FAQs') +
     '<section class="section"><div class="faq">' + S.all('faqs').slice().sort((a, b) => (a.order || 0) - (b.order || 0)).map(faqItem).join('') + '<p class="c muted" style="margin-top:24px">Still have a question? <a class="text-link" href="#/contact">Contact the school</a></p></div></section>';
 
   pages.contact = () => {
     const s = st();
     setTimeout(() => {
-      $('#enquiry').addEventListener('submit', e => {
+      $('#enquiry').addEventListener('submit', async e => {
         e.preventDefault();
         const form = e.target;
         if (!form.checkValidity()) { form.reportValidity(); return; }
         const d = U.formData(form);
         if (!U.validPhone(d.phone)) { U.toast('Please enter a valid Nigerian phone number, e.g. 08031234567.', 'warn'); form.phone.focus(); return; }
-        S.insert('enquiries', { name: d.name, phone: d.phone, email: d.email, level: d.level, message: d.message, created: new Date().toISOString(), status: 'New' });
-        S.log('public', 'New enquiry from ' + d.name + '.');
+        if (S.cloud) {
+          try { await Cloud.rpc('submit_enquiry', { p: { name: d.name, phone: d.phone, email: d.email, level: d.level, message: d.message } }); }
+          catch (err) { U.toast(err.message || 'Could not send. Please try again.', 'bad'); return; }
+        } else {
+          S.insert('enquiries', { name: d.name, phone: d.phone, email: d.email, level: d.level, message: d.message, created: new Date().toISOString(), status: 'New' });
+          S.log('public', 'New enquiry from ' + d.name + '.');
+        }
         form.reset();
         $('#enq-ok').innerHTML = '<div class="notice-box ok" style="margin-top:14px">Thank you, ' + esc(d.name.split(' ')[0]) + '. Your enquiry has been received and the school office will get back to you.</div>';
       });
@@ -478,6 +522,7 @@
   }
   let lastPage = null;
   function route() {
+    if (!S.data || !S.data.settings) return;
     // legacy anchors from the original one-page site (#about, #contact…)
     const legacy = { '#home': '#/', '#about': '#/about', '#levels': '#/academics', '#learning': '#/academics', '#life': '#/about', '#news': '#/news', '#admissions': '#/admissions', '#contact': '#/contact' };
     if (legacy[location.hash]) { location.replace(legacy[location.hash]); return; }
@@ -507,7 +552,17 @@
   window.addEventListener('scroll', () => toTop.classList.toggle('show', window.scrollY > 600), { passive: true });
   toTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
   window.addEventListener('hashchange', () => { U.closeModal(); document.querySelectorAll('.lightbox').forEach(l => l.remove()); route(); });
-  window.addEventListener('storage', e => { if (e.key === 'epiphany.db.v1') { S.load(); renderChrome(); route(); } });
-  renderChrome();
-  route();
+  window.addEventListener('storage', e => { if (!S.cloud && e.key === 'epiphany.db.v1') { S.load(); renderChrome(); route(); } });
+  main.innerHTML = '<section class="section c"><p class="muted">Loading…</p></section>';
+  Cloud.boot('site').then(state => {
+    if (state.error || state.needsSetup || state.needsData) {
+      main.innerHTML = '<section class="section c" style="min-height:50vh"><div class="eyebrow">Epiphany Schools</div><h2>' +
+        (state.error ? 'We could not load the website just now.' : 'Our new website is coming soon.') + '</h2><p class="muted">' +
+        esc(state.error || 'The school is setting up its website and portal.') + '</p><div class="form-actions" style="justify-content:center">' +
+        (state.error ? '<button class="btn" onclick="location.reload()">Try again</button>' : '<a class="btn" href="portal.html">Staff: open the portal</a>') + '</div></section>';
+      return;
+    }
+    renderChrome();
+    route();
+  });
 })();

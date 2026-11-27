@@ -427,6 +427,7 @@
   const listeners = [];
   const Store = {
     data: null,
+    resultContext: {},
     load() {
       const raw = adapter.read();
       if (raw) {
@@ -439,17 +440,32 @@
       this.save();
       return this;
     },
+    /** True when the school database (Supabase) is in use instead of this browser. */
+    get cloud() { return !!(global.EPS.Cloud && global.EPS.Cloud.enabled); },
     save() {
-      adapter.write(JSON.stringify(this.data));
+      // In cloud mode nothing is kept in browser storage: changed rows are synced to the database.
+      if (this.cloud) global.EPS.Cloud.schedule();
+      else adapter.write(JSON.stringify(this.data));
       listeners.forEach(fn => { try { fn(); } catch (e) { console.error(e); } });
     },
     onChange(fn) { listeners.push(fn); },
-    reset() { adapter.clear(); this.data = buildSeed(); this.save(); },
+    reset() {
+      if (this.cloud) throw new Error('Resetting is not available when connected to the school database.');
+      adapter.clear(); this.data = buildSeed(); this.save();
+    },
     exportJSON() { return JSON.stringify(this.data, null, 2); },
     importJSON(str) {
       const parsed = JSON.parse(str);
       if (!parsed || typeof parsed !== 'object' || !parsed.settings || !Array.isArray(parsed.students)) throw new Error('This file is not an Epiphany Schools backup.');
       parsed.version = DB_VERSION;
+      if (this.cloud && this.data) {
+        // Keep login links and never lock out the person restoring the backup.
+        const links = {};
+        (this.data.users || []).forEach(u => { if (u.authId) links[u.id] = u.authId; });
+        parsed.users = (parsed.users || []).map(u => { const c = Object.assign({}, u); delete c.password; if (links[c.id]) c.authId = links[c.id]; else delete c.authId; return c; });
+        const me = global.EPS.Cloud.me();
+        if (me && !parsed.users.some(u => u.id === me.id)) parsed.users.unshift(me);
+      }
       this.data = parsed; this.save();
     },
 
@@ -481,6 +497,7 @@
     get settings() { return this.data.settings; },
     setSettings(patch) { Object.assign(this.data.settings, patch); this.save(); },
     log(user, text) {
+      if (this.cloud && !global.EPS.Cloud.authUser) return; // public visitors: the server logs form submissions
       const log = this.all('log');
       log.unshift({ id: uid('log'), at: new Date().toISOString(), user, text });
       if (log.length > 300) log.length = 300;
@@ -514,11 +531,15 @@
       s[field] = value === '' || value == null ? null : Number(value);
       this.save(); return s;
     },
-    report(studentId, session, term) {
+    /** Report-card remarks. Pass create=true only when the caller is about to save changes. */
+    report(studentId, session, term, create) {
       session = session || this.settings.session; term = term || this.settings.term;
       const id = [studentId, session, term].join('|');
       let r = this.get('reports', id);
-      if (!r) { r = { id, studentId, session, term, teacherRemark: '', principalRemark: '', affective: {}, psychomotor: {} }; this.all('reports').push(r); }
+      if (!r) {
+        r = { id, studentId, session, term, teacherRemark: '', principalRemark: '', affective: {}, psychomotor: {} };
+        if (create || !this.cloud) this.all('reports').push(r);
+      }
       return r;
     },
 
@@ -561,7 +582,19 @@
       if (!s) return null;
       const res = this.classResults(s.classId, session, term);
       const row = res.rows.find(r => r.student.id === studentId);
-      return row ? Object.assign({}, res, { row }) : null;
+      if (!row) return null;
+      // Parents and students only receive their own child's scores; the server supplies the
+      // class position and statistics so no other child's marks are ever sent to them.
+      const ctx = this.resultContext[[studentId, res.session, res.term].join('|')];
+      if (ctx) {
+        const stats = {};
+        res.subjects.forEach(sub => { stats[sub] = (ctx.stats && ctx.stats[sub]) || { high: null, low: null, avg: null }; });
+        row.position = ctx.position == null ? undefined : Number(ctx.position);
+        row.subjects.forEach(x => { const p = ctx.subjectPositions && ctx.subjectPositions[x.subject]; x.position = p == null ? undefined : Number(p); });
+        Object.keys(stats).forEach(k => { const v = stats[k]; stats[k] = { high: v.high == null ? null : Number(v.high), low: v.low == null ? null : Number(v.low), avg: v.avg == null ? null : Number(v.avg) }; });
+        return Object.assign({}, res, { row, stats, count: Number(ctx.count), classAvg: ctx.classAvg == null ? null : Number(ctx.classAvg) });
+      }
+      return Object.assign({}, res, { row });
     },
 
     feesDue(studentId, session, term) {
@@ -590,6 +623,15 @@
       const total = present + absent + late;
       return { present, absent, late, total, pct: total ? (present + late) / total * 100 : null, days: days.map(d => ({ date: d.date, mark: d.records[studentId] })) };
     },
+    /** Turn a data set into an empty school: keeps structure, removes all sample people and records. */
+    emptySchool(d, admin) {
+      d.users = admin ? [admin] : [];
+      d.classes.forEach(c => { c.teacherId = null; });
+      ['students', 'scores', 'reports', 'attendance', 'payments', 'homework', 'news', 'events', 'applications', 'enquiries', 'messages', 'announcements', 'pins', 'testimonials', 'subscribers', 'log'].forEach(k => { d[k] = []; });
+      d.settings.demoMode = false;
+      d.settings.announcement = { active: false, text: '', link: '' };
+      return d;
+    },
     nextAdmissionNo() {
       const year = new Date().getFullYear();
       const max = this.all('students').reduce((m, s) => { const n = parseInt(String(s.admNo).split('/').pop(), 10); return isNaN(n) ? m : Math.max(m, n); }, 0);
@@ -607,7 +649,7 @@
   };
 
   global.EPS = Object.assign(global.EPS || {}, {
-    Store, uid, isoDate, today, pad, TERMS, SECTIONS, SUBJECTS, GRADE_SCALES, ASSESSMENT,
+    Store, uid, isoDate, today, pad, buildSeed, DB_VERSION, TERMS, SECTIONS, SUBJECTS, GRADE_SCALES, ASSESSMENT,
     AFFECTIVE_TRAITS, PSYCHOMOTOR_SKILLS, gradeFor, autoRemark, DAYS: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
   });
 })(window);

@@ -1,9 +1,10 @@
 /* Epiphany Schools — offline support (works when served over http/https). */
-const CACHE = 'epiphany-v1';
+const CACHE = 'epiphany-v2';
 const SHELL = [
   './', './index.html', './portal.html', './manifest.webmanifest',
   './assets/css/base.css', './assets/css/site.css', './assets/css/portal.css',
-  './assets/js/data.js', './assets/js/ui.js', './assets/js/site.js',
+  './assets/js/data.js', './assets/js/config.js', './assets/js/cloud.js', './assets/vendor/supabase-2.45.4.min.js',
+  './assets/js/ui.js', './assets/js/site.js',
   './assets/js/portal.js', './assets/js/portal-academic.js', './assets/js/portal-office.js',
   './assets/img/crest.svg'
 ];

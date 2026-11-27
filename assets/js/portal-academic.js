@@ -320,14 +320,18 @@
       foot: (!isNew && u.id !== P.me().id ? '<button class="btn danger" id="u-del" style="margin-right:auto">Delete</button>' : '') + (!isNew && (u.phone) ? '<a class="btn ghost" target="_blank" rel="noopener" href="' + attr(P.waLink(u.phone, 'Your ' + S.settings.schoolName + ' portal username is ' + u.username + '.')) + '">Send login via WhatsApp</a>' : '') + '<button class="btn ghost" data-close>Cancel</button><button class="btn" id="u-save">' + (isNew ? 'Create account' : 'Save') + '</button>'
     });
     const form = $('#u-form', m);
-    $('#u-save', m).onclick = () => {
+    $('#u-save', m).onclick = async () => {
       if (!form.checkValidity()) { form.reportValidity(); return; }
       const d = U.formData(form);
+      d.username = d.username.toLowerCase();
+      if (S.cloud && !/^[a-z0-9][a-z0-9._-]{2,39}$/.test(d.username)) { U.toast('Username must be 3–40 letters, numbers, dots, dashes or underscores.', 'warn'); return; }
+      if (S.cloud && d.password && d.password.length < 6) { U.toast('Use a password of at least 6 characters.', 'warn'); return; }
+      const before = { username: u.username, active: u.active !== false };
       if (S.find('users', x => x.username.toLowerCase() === d.username.toLowerCase() && x.id !== u.id)) { U.toast('That username is already taken.', 'bad'); return; }
       if (isNew && !d.password) { U.toast('Please set a password.', 'warn'); return; }
       if (u.id === P.me().id && d.active === 'no') { U.toast('You cannot disable your own account.', 'warn'); return; }
       const rec = { title: d.title, firstName: d.firstName, lastName: d.lastName, username: d.username, phone: d.phone, email: d.email, position: d.position || '', active: d.active !== 'no', role };
-      if (d.password) rec.password = d.password;
+      if (d.password && !S.cloud) rec.password = d.password;
       if (role === 'teacher') rec.classIds = $$('input[name=cls]:checked', form).map(i => i.value);
       if (role === 'parent') rec.childIds = Array.from($('#u-kids', form).selectedOptions).map(o => o.value);
       if (role === 'student') rec.studentId = d.studentId;
@@ -335,13 +339,34 @@
       if (isNew) saved = S.insert('users', rec); else saved = S.update('users', u.id, rec);
       if (role === 'parent') S.all('students').forEach(s => { s.parentIds = (s.parentIds || []).filter(id => id !== saved.id); if (rec.childIds.includes(s.id)) s.parentIds.push(saved.id); });
       S.save(); S.log(P.me().id, (isNew ? 'Created' : 'Updated') + ' ' + role + ' account ' + S.userName(saved) + '.');
+      if (S.cloud) {
+        // Logins live in Supabase Auth and are managed by the admin-users server function.
+        const btn = $('#u-save', m); btn.disabled = true; btn.textContent = 'Saving…';
+        try {
+          await EPS.Cloud.flush();
+          if (!saved.authId) {
+            if (d.password) { const r = await EPS.Cloud.admin('create', { userId: saved.id, username: saved.username, password: d.password }); saved.authId = r.authId; EPS.Cloud.markSynced('users', saved.id); }
+          } else {
+            const patch = {};
+            if (saved.username !== before.username) patch.username = saved.username;
+            if (d.password) patch.password = d.password;
+            if ((saved.active !== false) !== before.active) patch.active = saved.active !== false;
+            if (Object.keys(patch).length) await EPS.Cloud.admin('update', Object.assign({ userId: saved.id }, patch));
+          }
+        } catch (e) {
+          btn.disabled = false; btn.textContent = 'Save';
+          U.toast('The account was saved, but its login could not be updated: ' + e.message, 'bad');
+          return;
+        }
+      }
       U.closeModal();
       if (isNew) U.modal({ title: 'Account created', size: 'sm', body: '<p>Share these sign-in details with <b>' + esc(S.userName(saved)) + '</b>:</p><div class="notice-box">Portal: <b>' + esc(location.href.split('#')[0]) + '</b><br>Username: <b>' + esc(saved.username) + '</b><br>Password: <b>' + esc(d.password) + '</b></div>' + (saved.phone ? '<p style="margin-top:12px"><a class="btn" target="_blank" rel="noopener" href="' + attr(P.waLink(saved.phone, 'Welcome to the ' + S.settings.schoolName + ' portal. Sign in at ' + location.href.split('#')[0] + ' — username: ' + saved.username + ', password: ' + d.password + '. Please change your password after signing in.')) + '">Send via WhatsApp</a></p>' : ''), foot: '<button class="btn" data-close>Done</button>' });
       else U.toast('Account saved.');
       P.rerender();
     };
     const del = $('#u-del', m);
-    if (del) del.onclick = () => U.confirmBox('Delete the account for ' + S.userName(u) + '? They will no longer be able to sign in.', () => {
+    if (del) del.onclick = () => U.confirmBox('Delete the account for ' + S.userName(u) + '? They will no longer be able to sign in.', async () => {
+      if (S.cloud && u.authId) { try { await EPS.Cloud.admin('delete', { userId: u.id }); } catch (e) { U.toast('Could not remove the login: ' + e.message, 'bad'); return; } }
       S.all('classes').forEach(c => { if (c.teacherId === u.id) c.teacherId = null; });
       S.all('students').forEach(s => { if (s.parentIds) s.parentIds = s.parentIds.filter(id => id !== u.id); });
       S.remove('users', u.id); S.log(P.me().id, 'Deleted account ' + S.userName(u) + '.'); U.toast('Account deleted.'); P.rerender();
@@ -579,7 +604,7 @@
         $$('[data-view]').forEach(b => b.onclick = () => { const m = U.modal({ title: 'Report card', size: 'xl', body: U.reportCard(b.dataset.view), foot: '<button class="btn" id="rc-print">🖨 Print</button>' }); $('#rc-print', m).onclick = () => U.printHTML('Report card', U.reportCard(b.dataset.view)); });
         $$('[data-remarks]').forEach(b => b.onclick = () => remarksForm(b.dataset.remarks, isAdmin));
         $('#rp-auto').onclick = () => U.confirmBox('Fill empty teacher remarks for ' + res.cls.name + ' with suggestions based on each student\'s average? Existing remarks are kept.', () => {
-          let n = 0; res.rows.forEach(r => { const rep = S.report(r.student.id); if (!rep.teacherRemark && r.average != null) { rep.teacherRemark = EPS.autoRemark(r.average); n++; } }); S.save(); U.toast(n + ' remarks added.'); P.rerender();
+          let n = 0; res.rows.forEach(r => { const rep = S.report(r.student.id, null, null, true); if (!rep.teacherRemark && r.average != null) { rep.teacherRemark = EPS.autoRemark(r.average); n++; } }); S.save(); U.toast(n + ' remarks added.'); P.rerender();
         }, { yes: 'Fill remarks' });
         if (open) { const b = $('[data-remarks="' + open + '"]'); if (b) b.click(); }
       });
@@ -595,7 +620,7 @@
   };
   function remarksForm(studentId, isAdmin) {
     const s = S.get('students', studentId);
-    const rep = S.report(studentId);
+    const rep = S.report(studentId, null, null, true);
     const r = S.studentResult(studentId);
     const rating = (group, traits) => '<div style="display:grid;gap:8px">' + traits.map(t => '<label style="display:flex;justify-content:space-between;gap:10px;align-items:center;font-size:13px">' + esc(t) + '<select class="select" data-g="' + group + '" data-t="' + attr(t) + '">' + [5, 4, 3, 2, 1].map(n => '<option value="' + n + '"' + (Number((rep[group] || {})[t] || 4) === n ? ' selected' : '') + '>' + n + ' — ' + ['', 'Poor', 'Fair', 'Good', 'Very good', 'Excellent'][n] + '</option>').join('') + '</select></label>').join('') + '</div>';
     const m = U.modal({
@@ -643,7 +668,16 @@
         const kid = P.currentChild(ctx.q);
         if (!kid) return P.empty('No student linked.');
         const list = S.where('homework', h => h.classId === kid.classId).sort((a, b) => b.due.localeCompare(a.due));
-        ctx.mount(() => $$('[data-done]').forEach(b => b.onclick = () => { const h = S.get('homework', b.dataset.done); const i = h.doneBy.indexOf(kid.id); if (i >= 0) h.doneBy.splice(i, 1); else h.doneBy.push(kid.id); S.save(); P.rerender(); }));
+        ctx.mount(() => $$('[data-done]').forEach(b => b.onclick = async () => {
+          const h = S.get('homework', b.dataset.done);
+          if (S.cloud) {
+            b.disabled = true;
+            try { h.doneBy = await EPS.Cloud.rpc('toggle_homework', { p_homework: h.id, p_student: kid.id }); EPS.Cloud.markSynced('homework', h.id); }
+            catch (e) { U.toast(e.message, 'bad'); }
+            P.rerender(); return;
+          }
+          const i = h.doneBy.indexOf(kid.id); if (i >= 0) h.doneBy.splice(i, 1); else h.doneBy.push(kid.id); S.save(); P.rerender();
+        }));
         return P.pageHead('Homework', esc(S.studentName(kid)) + ' · ' + esc((S.classOf(kid) || {}).name)) + P.childSwitcher(ctx.q, 'homework') +
           (list.length ? '<div class="grid">' + list.map(h => { const done = h.doneBy.includes(kid.id); const over = !done && h.due < t; return '<div class="panel hw' + (done ? ' done' : over ? ' overdue' : '') + '"><div class="panel-head"><div><small class="muted">' + esc(h.subject) + ' · set by ' + esc(S.userName(h.teacherId)) + '</small><h3>' + esc(h.title) + '</h3></div>' + (done ? '<span class="badge ok">Done</span>' : over ? '<span class="badge bad">Overdue</span>' : '<span class="badge info">Due ' + fmtDate(h.due, 'day') + '</span>') + '</div><p style="margin:0 0 12px">' + esc(h.details) + '</p><button class="btn sm ' + (done ? 'ghost' : 'ok') + '" data-done="' + h.id + '">' + (done ? 'Mark as not done' : '✓ Mark as done') + '</button></div>'; }).join('') + '</div>' : P.empty('No homework has been set yet.'));
       }

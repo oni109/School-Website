@@ -4,7 +4,7 @@
    ===================================================================== */
 (function () {
   'use strict';
-  const EPS = window.EPS, S = EPS.Store.load(), U = EPS.UI;
+  const EPS = window.EPS, S = EPS.Store, U = EPS.UI, Cloud = EPS.Cloud;
   const { esc, attr } = U;
   const $ = (sel, root) => (root || document).querySelector(sel);
   const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
@@ -24,8 +24,20 @@
     } catch (e) { }
   }
   function clearSession() { try { sessionStorage.removeItem(SESSION_KEY); localStorage.removeItem(SESSION_KEY); } catch (e) { } }
-  P.me = () => { const id = readSession(); const u = id ? S.get('users', id) : null; return u && u.active !== false ? u : null; };
-  P.logout = () => { const me = P.me(); if (me) S.log(me.id, 'Signed out.'); clearSession(); location.hash = ''; render(); };
+  P.me = () => {
+    if (!S.data) return null;
+    if (S.cloud) return Cloud.me();
+    const id = readSession(); const u = id ? S.get('users', id) : null; return u && u.active !== false ? u : null;
+  };
+  P.logout = async () => {
+    const me = P.me(); if (me) S.log(me.id, 'Signed out.');
+    if (S.cloud) {
+      try { await Cloud.flush(); } catch (e) { }
+      await Cloud.signOut();
+      bootState = await Cloud.boot('portal');
+    } else clearSession();
+    history.replaceState(null, '', location.pathname); render();
+  };
 
   /* ---------- permissions & scope ---------- */
   P.isAdmin = () => { const m = P.me(); return m && m.role === 'admin'; };
@@ -157,8 +169,11 @@
   function renderLogin(err) {
     const st = S.settings;
     document.title = 'Portal login | ' + st.schoolName;
+    // With the school database, the administrator's password is private, so only the sample
+    // teacher, parent and student logins are offered as demo shortcuts.
+    const demoAccounts = [['admin', 'admin123', 'Administrator', 'Full school office'], ['teacher', 'teacher123', 'Teacher', 'Mrs. Eze · Primary 4'], ['parent', 'parent123', 'Parent', 'Mr. Okafor · 2 children'], ['student', 'student123', 'Student', 'Chinedu · JSS 2']].filter(a => !S.cloud || a[0] !== 'admin');
     const demo = st.demoMode ? '<div><p class="hint" style="margin:0 0 8px"><b>Demo accounts</b> — tap to sign in:</p><div class="demo-accounts">' +
-      [['admin', 'admin123', 'Administrator', 'Full school office'], ['teacher', 'teacher123', 'Teacher', 'Mrs. Eze · Primary 4'], ['parent', 'parent123', 'Parent', 'Mr. Okafor · 2 children'], ['student', 'student123', 'Student', 'Chinedu · JSS 2']]
+      demoAccounts
         .map(a => '<button type="button" data-u="' + a[0] + '" data-p="' + a[1] + '"><b>' + a[2] + '</b><small>' + a[3] + '</small></button>').join('') + '</div></div>' : '';
     app.innerHTML = '<div class="login"><div class="login-art"><a class="brand" href="index.html">' + U.crest(46) + '<span><strong>' + esc(st.schoolName) + '</strong><small>' + esc((st.town + ' · ' + st.state).toUpperCase()) + '</small></span></a>' +
       '<div><h1>One portal for the whole school community.</h1><p>Administrators, teachers, parents and students — everything in one secure place.</p><ul><li>Report cards, positions and printable results</li><li>Daily attendance and homework</li><li>Fees, receipts and balances</li><li>Messages between parents and teachers</li><li>Admissions, enquiries and website updates</li></ul></div>' +
@@ -170,7 +185,21 @@
       '<button class="btn block">SIGN IN</button>' + demo +
       '<p class="hint" style="margin:0">Forgot your password? Contact the school office to reset it. · <a class="link-btn" href="index.html">← Back to website</a></p></form></div></div>';
     const form = $('#login-form');
-    const attempt = (u, p, remember) => {
+    const attempt = async (u, p, remember) => {
+      if (S.cloud) {
+        const btn = $('button.btn.block', form); btn.disabled = true; btn.textContent = 'SIGNING IN…';
+        try {
+          await Cloud.signIn(u, p, remember);
+          bootState = await Cloud.boot('portal');
+          const me = P.me();
+          if (!me) { await Cloud.signOut(); bootState = await Cloud.boot('portal'); renderLogin('This login is not linked to an active school account. Please contact the school office.'); return; }
+          S.update('users', me.id, { lastLogin: new Date().toISOString() });
+          S.log(me.id, 'Signed in.');
+          location.hash = '#/dashboard';
+          render();
+        } catch (e) { renderLogin(e.message); }
+        return;
+      }
       const user = S.find('users', x => x.username.toLowerCase() === String(u).toLowerCase() && x.password === p);
       if (!user) { renderLogin('Incorrect username or password.'); return; }
       if (user.active === false) { renderLogin('This account has been deactivated. Please contact the school office.'); return; }
@@ -195,15 +224,18 @@
     return '<div class="shell"><aside class="side" id="side" aria-label="Portal navigation"><a class="side-brand" href="#/dashboard">' + U.crest(36) + '<span><strong>' + esc(st.schoolName) + '</strong><small>' + esc(me.role.toUpperCase()) + ' PORTAL</small></span></a><nav>' + nav + '</nav>' +
       '<div class="side-foot">' + esc(st.session) + ' · ' + esc(S.termLabel()) + '<br><a href="index.html">View public website ↗</a></div></aside><div class="overlay" id="overlay"></div>' +
       '<div class="main">' +
-      (st.demoMode ? '<div class="demo-strip"><span>🧪 <b>Demo mode</b> — sample data stored only in this browser.' + (me.role === 'admin' ? ' Switch off in Settings when going live.' : '') + '</span>' + (me.role === 'admin' ? '<a href="#/data">Reset or start fresh</a>' : '') + '</div>' : '') +
+      (st.demoMode ? '<div class="demo-strip"><span>🧪 <b>Demo mode</b> — ' + (S.cloud ? 'sample data in the school database.' : 'sample data stored only in this browser.') + (me.role === 'admin' ? ' Switch off in Settings when going live.' : '') + '</span>' + (me.role === 'admin' ? '<a href="#/data">Reset or start fresh</a>' : '') + '</div>' : '') +
       '<header class="topnav"><button class="icon-btn burger" id="burger" aria-label="Open menu">☰</button>' +
       (me.role === 'admin' || me.role === 'teacher' ? '<div class="gsearch"><label class="sr-only" for="gsearch">Search students</label><input id="gsearch" type="search" placeholder="Search students by name or admission no…" autocomplete="off"><div class="gsearch-results hidden" id="gsearch-results"></div></div>' : '<span class="spacer"></span>') +
-      '<span class="spacer"></span><div class="top-actions">' +
+      '<span class="spacer"></span><div class="top-actions">' + (S.cloud ? '<span class="sync" id="sync-status" role="status" aria-live="polite">' + syncLabel(Cloud.status) + '</span>' : '') +
       '<button class="icon-btn" id="p-theme" aria-label="Toggle dark mode" title="Toggle dark mode"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>' +
       '<div style="position:relative"><button class="icon-btn bell" id="bell" aria-label="Notifications (' + notes.length + ')" aria-expanded="false">🔔' + (notes.length ? '<span class="dot">' + notes.length + '</span>' : '') + '</button><div class="dropdown hidden" id="bell-dd"><h5>Notifications</h5>' + (notes.length ? notes.map(n => '<a href="' + attr(n.href) + '">' + esc(n.text) + '<small>' + esc(n.sub || '') + '</small></a>').join('') : '<p class="empty" style="padding:20px">You are all caught up.</p>') + '</div></div>' +
       '<div style="position:relative"><button class="userchip" id="userchip" aria-expanded="false" aria-haspopup="true">' + P.avatar(S.userName(me)) + '<span class="who"><b>' + esc(me.firstName + ' ' + me.lastName) + '</b><br><small>' + esc(me.position || me.role) + '</small></span></button>' +
       '<div class="dropdown hidden" id="user-dd"><a href="#/account">👤 My account &amp; password</a><button class="dd-item" id="logout">↩ Sign out</button></div></div>' +
       '</div></header><div class="content" id="content">' + inner + '</div></div></div>';
+  }
+  function syncLabel(s) {
+    return { saving: '<span class="dot-s warn"></span>Saving…', saved: '<span class="dot-s ok"></span>Saved', offline: '<span class="dot-s bad"></span>Offline — will retry', error: '<span class="dot-s bad"></span>Not saved' }[s] || '<span class="dot-s ok"></span>Connected';
   }
   function notifications(me) {
     const out = [];
@@ -256,11 +288,16 @@
     render(ctx) {
       const me = ctx.me;
       ctx.mount(() => {
-        P.bindForm($('#acc-form'), d => {
-          if (d.current !== me.password) { U.toast('Your current password is incorrect.', 'bad'); return; }
+        P.bindForm($('#acc-form'), async d => {
           if (d.next.length < 6) { U.toast('Use at least 6 characters.', 'warn'); return; }
           if (d.next !== d.confirm) { U.toast('The new passwords do not match.', 'warn'); return; }
-          S.update('users', me.id, { password: d.next }); S.log(me.id, 'Changed password.');
+          if (S.cloud) {
+            try { await Cloud.changePassword(d.current, d.next); } catch (e) { U.toast(e.message, 'bad'); return; }
+            S.log(me.id, 'Changed password.');
+          } else {
+            if (d.current !== me.password) { U.toast('Your current password is incorrect.', 'bad'); return; }
+            S.update('users', me.id, { password: d.next }); S.log(me.id, 'Changed password.');
+          }
           U.toast('Password updated.'); $('#acc-form').reset();
         });
         P.bindForm($('#prof-form'), d => { S.update('users', me.id, { phone: d.phone, email: d.email }); U.toast('Contact details saved.'); });
@@ -272,8 +309,21 @@
   };
 
   /* ---------- render ---------- */
+  let bootState = null;
+  function renderMessage(title, text, actions) {
+    app.innerHTML = '<div class="login"><div class="login-art"><a class="brand" href="index.html">' + U.crest(46) + '<span><strong>School portal</strong></span></a><div></div></div><div class="login-form"><div style="width:min(420px,100%)"><h2 style="font:700 28px var(--serif);margin:0 0 8px">' + esc(title) + '</h2><p class="muted">' + esc(text) + '</p><div class="form-actions">' + (actions || '') + '</div></div></div></div>';
+  }
   function render() {
+    if (!bootState) { renderMessage('Loading…', 'Connecting to the school portal.'); return; }
+    if (bootState.error) { renderMessage('Cannot open the portal', bootState.error, '<button class="btn" onclick="location.reload()">Try again</button>'); return; }
+    if (bootState.needsSetup) { renderSetup(); return; }
     const me = P.me();
+    if (bootState.needsData) {
+      if (me && me.role === 'admin') { renderSetup(true); return; }
+      if (!Cloud.authUser) { renderLoginBare(); return; }
+      renderMessage('Setup not finished', 'The school administrator has not finished setting up the portal yet.', '<button class="btn" id="so">Sign out</button>');
+      $('#so').onclick = P.logout; return;
+    }
     if (!me) { renderLogin(); return; }
     const { view, arg, q } = parseHash();
     const v = P.views[view];
@@ -296,8 +346,80 @@
   /** Re-render without jumping to the top (after in-page actions). */
   P.rerender = () => { P._keepScroll = true; render(); };
 
-  window.addEventListener('hashchange', () => { U.closeModal(); render(); });
-  window.addEventListener('storage', e => { if (e.key === 'epiphany.db.v1') { S.load(); P.rerender(); } });
-  document.addEventListener('DOMContentLoaded', render);
+  /* ---------- first-time setup (school database) ---------- */
+  function renderLoginBare() {
+    // Settings are not loaded yet, so show a plain sign-in form.
+    app.innerHTML = '<div class="login"><div class="login-art"><a class="brand" href="index.html">' + U.crest(46) + '<span><strong>School portal</strong></span></a><div><h1>Finish setting up your school.</h1></div><span></span></div><div class="login-form"><form id="bare-login"><h2>Administrator sign in</h2>' +
+      U.field('username', 'Username', { required: true, autocomplete: 'username' }) + U.field('password', 'Password', { required: true, type: 'password', autocomplete: 'current-password' }) + '<button class="btn block">SIGN IN</button><div id="bare-err"></div></form></div></div>';
+    P.bindForm($('#bare-login'), async d => {
+      try { await Cloud.signIn(d.username, d.password, false); bootState = await Cloud.boot('portal'); render(); }
+      catch (e) { $('#bare-err').innerHTML = '<div class="notice-box warn">' + esc(e.message) + '</div>'; }
+    });
+  }
+  function renderSetup(finishOnly) {
+    document.title = 'Set up the school portal';
+    app.innerHTML = '<div class="login"><div class="login-art"><a class="brand" href="index.html">' + U.crest(46) + '<span><strong>School portal</strong><small>FIRST-TIME SETUP</small></span></a>' +
+      '<div><h1>' + (finishOnly ? 'Almost there.' : 'Welcome! Let\'s set up your school.') + '</h1><p>' + (finishOnly ? 'Choose how to start your school\'s data.' : 'Create the administrator account that will manage the website and portal. Keep these details safe — this account can create logins for staff and parents.') + '</p></div><span></span></div>' +
+      '<div class="login-form"><form id="setup-form" style="width:min(440px,100%)"><h2>' + (finishOnly ? 'Choose starting data' : 'Create administrator') + '</h2>' +
+      (finishOnly ? '' : '<div class="form-grid">' + U.field('firstName', 'First name', { required: true }) + U.field('lastName', 'Surname', { required: true }) + '</div>' +
+        U.field('username', 'Username', { required: true, autocomplete: 'username', pattern: '[A-Za-z0-9][A-Za-z0-9._\\-]{2,39}', hint: 'Letters, numbers, dots or dashes, e.g. principal' }) +
+        U.field('password', 'Password', { required: true, type: 'password', autocomplete: 'new-password', hint: 'At least 8 characters.' }) + U.field('confirm', 'Confirm password', { required: true, type: 'password', autocomplete: 'new-password' })) +
+      U.field('schoolName', 'School name', { required: true, value: 'Epiphany Schools' }) +
+      '<fieldset class="field" style="border:0;padding:0;margin:0"><legend style="font-size:11px;font-weight:800;letter-spacing:.6px;margin-bottom:6px">STARTING DATA</legend>' +
+      '<label class="check"><input type="radio" name="start" value="sample" checked> <span><b>Sample school</b> — 90 fictional students, staff, results and fees so you can explore. Remove it later with “Start fresh”.</span></label>' +
+      '<label class="check" style="margin-top:8px"><input type="radio" name="start" value="empty"> <span><b>Empty school</b> — classes, subjects and timetables only. Add your real staff and students.</span></label></fieldset>' +
+      '<button class="btn block" id="setup-go">' + (finishOnly ? 'CONTINUE' : 'CREATE SCHOOL PORTAL') + '</button><div id="setup-msg" aria-live="polite"></div></form></div></div>';
+    const form = $('#setup-form'), msg = $('#setup-msg'), go = $('#setup-go');
+    P.bindForm(form, async d => {
+      if (!finishOnly) {
+        if (d.password.length < 8) { msg.innerHTML = '<div class="notice-box warn">Use a password of at least 8 characters.</div>'; return; }
+        if (d.password !== d.confirm) { msg.innerHTML = '<div class="notice-box warn">The passwords do not match.</div>'; return; }
+      }
+      go.disabled = true;
+      const step = t => { go.textContent = t; };
+      try {
+        if (!finishOnly) {
+          step('CREATING ADMINISTRATOR…');
+          await Cloud.admin('bootstrap', { username: d.username.toLowerCase(), password: d.password, firstName: d.firstName, lastName: d.lastName });
+          await Cloud.signIn(d.username, d.password, false);
+          await Cloud.loadAll();
+        }
+        step(d.start === 'sample' ? 'LOADING SAMPLE SCHOOL… (about a minute)' : 'PREPARING SCHOOL…');
+        const res = await Cloud.seedSchool({ sample: d.start === 'sample', schoolName: d.schoolName });
+        bootState = await Cloud.boot('portal');
+        location.hash = '#/dashboard';
+        render();
+        if (d.start === 'sample') {
+          const others = Object.entries(res.passwords).filter(([id, pw]) => !/123$/.test(pw)).map(([id, pw]) => { const u = S.get('users', id); return u ? esc(u.username) + ' / ' + esc(pw) : ''; }).filter(Boolean);
+          U.modal({ title: 'Your school portal is ready', body: '<p>Sample logins have been created:</p><div class="notice-box">Teacher: <b>teacher</b> / teacher123<br>Parent: <b>parent</b> / parent123<br>Student: <b>student</b> / student123</div>' + (others.length ? '<p class="hint" style="margin-top:10px">Other sample staff: ' + others.join(' · ') + '</p>' : '') + '<p class="hint">Before sharing with families, use <b>Data &amp; backup → Start fresh</b> to remove the sample data.</p>', foot: '<button class="btn" data-close>Start exploring</button>' });
+        }
+      } catch (e) {
+        console.error(e);
+        go.disabled = false; go.textContent = 'TRY AGAIN';
+        msg.innerHTML = '<div class="notice-box warn">' + esc(e.message) + '</div>';
+        if (Cloud.authUser) { bootState = { needsData: true }; }
+      }
+    });
+  }
+
+  /* ---------- live updates & save status ---------- */
+  let pendingRemote = false;
+  const busy = () => document.querySelector('.modal-backdrop') || (document.activeElement && /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName) && document.activeElement.id !== 'gsearch');
+  Cloud.onRemoteChange = force => {
+    if (!P.me()) return;
+    if (!force && busy()) { pendingRemote = true; return; }
+    pendingRemote = false; P.rerender();
+  };
+  document.addEventListener('focusout', () => setTimeout(() => { if (pendingRemote && !busy()) { pendingRemote = false; P.rerender(); } }, 200));
+  Cloud.onStatus = s => { const el = $('#sync-status'); if (el) el.innerHTML = syncLabel(s); };
+  Cloud.onSignedOut = () => { if (bootState && bootState.ok && !Cloud.authUser && P.me() === null) render(); };
+
+  window.addEventListener('hashchange', () => { U.closeModal(); if (pendingRemote) pendingRemote = false; render(); });
+  window.addEventListener('storage', e => { if (!S.cloud && e.key === 'epiphany.db.v1') { S.load(); P.rerender(); } });
+  document.addEventListener('DOMContentLoaded', async () => {
+    render();
+    bootState = await Cloud.boot('portal');
+    render();
+  });
   P.start = render;
 })();

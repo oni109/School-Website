@@ -287,7 +287,11 @@
       const u = ctx.me;
       const threads = S.all('messages').filter(t => visible(t, u)).sort((a, b) => b.updated.localeCompare(a.updated));
       const cur = ctx.arg ? threads.find(t => t.id === ctx.arg) : null;
-      if (cur && !(cur.readBy || []).includes(u.id)) { cur.readBy = [...(cur.readBy || []), u.id]; S.save(); }
+      if (cur && !(cur.readBy || []).includes(u.id)) {
+        cur.readBy = [...(cur.readBy || []), u.id];
+        if (S.cloud) { EPS.Cloud.markSynced('messages', cur.id); EPS.Cloud.rpc('mark_thread_read', { p_thread: cur.id }).catch(e => console.warn(e)); }
+        else S.save();
+      }
       ctx.mount(() => {
         $('#msg-new').onclick = () => {
           const opts = recipientsFor(u);
@@ -304,12 +308,20 @@
         if (rf) {
           const ta = $('textarea', rf);
           ta.addEventListener('keydown', e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) rf.requestSubmit(); });
-          rf.addEventListener('submit', e => {
+          rf.addEventListener('submit', async e => {
             e.preventDefault();
             const text = ta.value.trim(); if (!text) return;
-            cur.messages.push({ from: u.id, at: new Date().toISOString(), text });
-            cur.updated = new Date().toISOString(); cur.readBy = [u.id];
-            S.save(); P.rerender();
+            if (S.cloud) {
+              // Appended on the server so two people replying at once never overwrite each other.
+              const btn = $('button', rf); btn.disabled = true;
+              try { const t = await EPS.Cloud.rpc('post_message', { p_thread: cur.id, p_text: text }); Object.assign(cur, t); EPS.Cloud.markSynced('messages', cur.id); }
+              catch (err) { btn.disabled = false; U.toast(err.message, 'bad'); return; }
+            } else {
+              cur.messages.push({ from: u.id, at: new Date().toISOString(), text });
+              cur.updated = new Date().toISOString(); cur.readBy = [u.id];
+              S.save();
+            }
+            P.rerender();
             setTimeout(() => { const b = $('.bubbles'); if (b) b.scrollTop = b.scrollHeight; const t = $('#reply-form textarea'); if (t) t.focus(); });
           });
           const b = $('.bubbles'); if (b) b.scrollTop = b.scrollHeight;
@@ -551,26 +563,34 @@
             file.text().then(t => { try { S.importJSON(t); U.toast('Backup restored.'); P.go('dashboard'); } catch (err) { U.toast(err.message, 'bad'); } });
           }, { danger: true, yes: 'Restore backup' });
         };
-        $('#bk-reset').onclick = () => U.confirmBox('Reset everything to the original demo data? All changes will be lost.', () => { S.reset(); U.toast('Demo data restored.'); P.go('dashboard'); }, { danger: true, yes: 'Reset demo' });
+        $('#bk-reset').onclick = () => U.confirmBox(S.cloud ? 'Replace ALL data in the school database with the sample school? Every other login will be removed and sample logins created. Your administrator account is kept.' : 'Reset everything to the original demo data? All changes will be lost.', async () => {
+          if (!S.cloud) { S.reset(); U.toast('Demo data restored.'); P.go('dashboard'); return; }
+          U.toast('Loading the sample school… this takes about a minute.', 'info');
+          try { await EPS.Cloud.seedSchool({ sample: true, schoolName: S.settings.schoolName }); await EPS.Cloud.reload(); U.toast('Sample school loaded. Logins: teacher / teacher123, parent / parent123, student / student123.'); P.go('dashboard'); }
+          catch (e) { U.toast('Could not load the sample school: ' + e.message, 'bad'); }
+        }, { danger: true, yes: S.cloud ? 'Load sample school' : 'Reset demo' });
         $('#bk-fresh').onclick = () => U.confirmBox('Remove all sample students, staff, results, payments, news and messages so you can enter your real school data? Classes, subjects, timetables, fee items, FAQs, settings and your admin login are kept. Demo mode will be switched off.', startFresh, { danger: true, yes: 'Start fresh' });
       });
       return P.pageHead('Data & backup', 'Your school\'s records, safely kept.') +
-        '<div class="notice-box warn" style="margin-bottom:18px"><b>Important:</b> in this edition, data is saved in this web browser on this device. Download a backup regularly (for example every Friday) and keep it somewhere safe. To share data across many devices, connect the portal to an online database — see the README.</div>' +
-        '<div class="grid k2"><div class="panel"><h3>Storage</h3><p>' + kb + ' KB used of about ' + limit + ' KB available in this browser.</p><div class="storage-meter"><span style="width:' + Math.min(100, kb / limit * 100).toFixed(1) + '%;' + (kb / limit > .8 ? 'background:var(--red)' : '') + '"></span></div>' +
+        (S.cloud
+          ? '<div class="notice-box ok" style="margin-bottom:18px"><b>Connected to the school database.</b> Records are saved online as you work and are available on any device. Supabase keeps daily backups on paid plans; downloading your own backup each term is still good practice.</div>'
+          : '<div class="notice-box warn" style="margin-bottom:18px"><b>Important:</b> in this edition, data is saved in this web browser on this device. Download a backup regularly (for example every Friday) and keep it somewhere safe. To share data across many devices, connect the portal to an online database — see the README.</div>') +
+        '<div class="grid k2"><div class="panel"><h3>Storage</h3>' + (S.cloud ? '<p>' + kb + ' KB of school records in the database.</p>' : '<p>' + kb + ' KB used of about ' + limit + ' KB available in this browser.</p><div class="storage-meter"><span style="width:' + Math.min(100, kb / limit * 100).toFixed(1) + '%;' + (kb / limit > .8 ? 'background:var(--red)' : '') + '"></span></div>') +
         '<dl class="dl" style="margin-top:16px">' + [['Students', S.all('students').length], ['User accounts', S.all('users').length], ['Score entries', S.all('scores').length], ['Attendance registers', S.all('attendance').length], ['Payments', S.all('payments').length], ['Messages', S.all('messages').length]].map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join('') + '</dl></div>' +
         '<div class="panel"><h3>Backup & restore</h3><div class="form-actions"><button class="btn" id="bk-export">⬇ Download backup</button><label class="btn ghost" style="cursor:pointer">⬆ Restore from backup<input type="file" id="bk-import" accept=".json,application/json" class="sr-only"></label></div>' +
-        '<h3 style="margin-top:26px">Going live</h3><p class="muted">Ready to use the portal for your real school? Start fresh to clear the sample data.</p><div class="form-actions"><button class="btn danger" id="bk-fresh">Start fresh (remove sample data)</button><button class="btn ghost" id="bk-reset">Reset demo data</button></div></div></div>';
+        '<h3 style="margin-top:26px">Going live</h3><p class="muted">Ready to use the portal for your real school? Start fresh to clear the sample data.</p><div class="form-actions"><button class="btn danger" id="bk-fresh">Start fresh (remove sample data)</button><button class="btn ghost" id="bk-reset">' + (S.cloud ? 'Load sample school' : 'Reset demo data') + '</button></div></div></div>';
     }
   };
-  function startFresh() {
+  async function startFresh() {
     const d = S.data;
     const admin = d.users.find(u => u.id === me().id);
-    d.users = [admin];
-    d.classes.forEach(c => { c.teacherId = null; });
-    ['students', 'scores', 'reports', 'attendance', 'payments', 'homework', 'news', 'events', 'applications', 'enquiries', 'messages', 'announcements', 'pins', 'testimonials', 'subscribers'].forEach(k => { d[k] = []; });
-    d.settings.demoMode = false;
-    d.settings.announcement = { active: false, text: '', link: '' };
-    d.log = [];
+    if (S.cloud) {
+      // Remove every other login first so no old sample accounts can still sign in.
+      for (const u of d.users) {
+        if (u.id !== admin.id && u.authId) { try { await EPS.Cloud.admin('delete', { userId: u.id }); } catch (e) { U.toast('Could not remove login ' + u.username + ': ' + e.message, 'bad'); return; } }
+      }
+    }
+    S.emptySchool(d, admin);
     S.save(); S.log(admin.id, 'Started fresh — sample data removed.');
     U.toast('Sample data removed. Start by checking Settings, then add staff and students.');
     P.go('settings');
