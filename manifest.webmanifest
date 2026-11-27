@@ -1,0 +1,18 @@
+{
+  "name": "Epiphany Schools",
+  "short_name": "Epiphany",
+  "description": "Epiphany Schools website and portal — admissions, results, attendance, fees and messages.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#142b4a",
+  "icons": [
+    { "src": "assets/img/crest.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ],
+  "shortcuts": [
+    { "name": "Portal login", "url": "./portal.html" },
+    { "name": "Result checker", "url": "./index.html#/results" },
+    { "name": "Apply online", "url": "./index.html#/apply" }
+  ]
+}
